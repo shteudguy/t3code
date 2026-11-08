@@ -18,6 +18,7 @@ import { grokClient } from "@t3tools/provider-grok/client";
 import { kiroClient } from "@t3tools/provider-kiro/client";
 import { museClient } from "@t3tools/provider-muse/client";
 import { openCodeClient } from "@t3tools/provider-opencode/client";
+import { deepSeekClient } from "@t3tools/provider-deepseek/client";
 import { piClient } from "@t3tools/provider-pi/client";
 import {
   readSecretFieldValues,
@@ -39,6 +40,7 @@ const providerSecretFields = new Map([
     museClient,
     openCodeClient,
     piClient,
+    deepSeekClient,
     acpRegistryClient,
   ].map(
     (definition) =>

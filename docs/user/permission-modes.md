@@ -26,6 +26,9 @@ the parent conversation with the subagent's name, so you can respond without swi
 
 ## Provider differences
 
+DeepSeek API offers **Supervised**, **Auto-accept edits**, and **Full access** for its native
+tools. It has no automatic approval review. See [DeepSeek API](./providers-deepseek.md).
+
 Providers enforce permissions differently. Some read-only actions can proceed in **Supervised**.
 **Auto** uses automatic review on Codex, Claude, Cursor, Grok, and fx; providers without an equivalent,
 including OpenCode and Antigravity, fall back to asking. On Grok, commands its review blocks come

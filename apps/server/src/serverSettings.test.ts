@@ -1319,8 +1319,13 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("server settings"
         const fs = yield* FileSystem.FileSystem;
         const store = yield* ServerSecretStore.ServerSecretStore;
         const instanceId = ProviderInstanceId.make("antigravity_secrets");
+        const deepSeekId = ProviderInstanceId.make("deepseek_secrets");
         const saved = yield* service.updateSettings({
           providerInstances: {
+            [deepSeekId]: {
+              driver: ProviderDriverKind.make("deepseek-api"),
+              config: { apiKey: "deepseek-config-secret" },
+            },
             [instanceId]: {
               driver: ProviderDriverKind.make("antigravity"),
               config: { apiKey: "config-secret" },
@@ -1356,6 +1361,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("server settings"
           ],
         });
         const values = [
+          "deepseek-config-secret",
           "config-secret",
           "env-secret",
           "github-secret",
@@ -1431,6 +1437,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("server settings"
           }),
           sourceControlHostSecretName({ kind: "gitcafe", field: "token", serverHost: null }),
           "usage-limit-source-aHVi",
+          "provider-config-ZGVlcHNlZWtfc2VjcmV0cw-ZGVlcHNlZWstYXBp-YXBpS2V5",
         ];
         for (const name of secretNames) {
           assert.isTrue(Option.isSome(yield* store.get(name)), name);

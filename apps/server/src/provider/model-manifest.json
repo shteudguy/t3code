@@ -1,7 +1,8 @@
 {
   "version": 1,
-  "updatedAt": "2026-11-05T22:38:29Z",
+  "updatedAt": "2026-11-07T00:00:00Z",
   "compatibility": [
+    { "driver": "deepseek-api", "t3CodeRange": ">=0.0.46", "ranges": [] },
     {
       "driver": "codex",
       "t3CodeRange": ">=0.0.44",
@@ -118,6 +119,7 @@
     }
   ],
   "currentModels": {
+    "deepseek-api": ["deepseek-flash", "deepseek-v4-pro"],
     "codex": [
       "gpt-6-astra",
       "gpt-6.1-sol",
@@ -129,6 +131,14 @@
     "antigravity": ["gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low"]
   },
   "providers": {
+    "deepseek-api": {
+      "defaults": { "chat": "deepseek-flash" },
+      "profiles": {},
+      "models": [
+        { "slug": "deepseek-flash", "name": "DeepSeek Flash", "status": "current" },
+        { "slug": "deepseek-v4-pro", "name": "DeepSeek V4 Pro", "status": "current" }
+      ]
+    },
     "codex": {
       "profiles": {},
       "models": [

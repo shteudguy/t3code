@@ -73,7 +73,7 @@ const SETTINGS_SEARCH_TERMS = {
   SettingsArchive: ["archive", "archived", "restore", "unarchive"],
   SettingsProviderAccounts: [
     "provider accounts",
-    "codex",
+    "deepseek official api key native reasoning codex",
     "claude",
     "cursor",
     "opencode",

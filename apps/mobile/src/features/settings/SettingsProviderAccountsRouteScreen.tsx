@@ -33,6 +33,8 @@ import { SettingsScreen } from "./components/SettingsScreen";
 import { SettingsSection } from "./components/SettingsSection";
 import { AddClaudeAccount, ClaudeAccount } from "./ClaudeAccounts";
 import { CLAUDE_DRIVER } from "./claude-accounts";
+import { DeepSeekAccount } from "./DeepSeekAccount";
+import { DEEPSEEK_DRIVER } from "./deepseek-accounts";
 import { useSettingsEnvironmentFilter, type SettingsTarget } from "./settings-environment-filter";
 
 export function SettingsProviderAccountsRouteScreen() {
@@ -83,6 +85,10 @@ function EnvironmentProviders({
   readonly providers: ReadonlyArray<ServerProvider>;
 }) {
   const accounts = providers.filter(canManageProvider);
+  const deepSeekAccounts = providers.filter((provider) => provider.driver === DEEPSEEK_DRIVER);
+  const canAddDeepSeek =
+    deepSeekAccounts.length === 0 &&
+    isManagedDriverAllowed(environment.serverConfig.managedPolicy, DEEPSEEK_DRIVER);
   // Claude has no in-app sign-in; each account is its own instance on a signed-in config folder.
   const claudeAccounts = providers.filter(
     (provider) => provider.driver === CLAUDE_DRIVER && !canManageProvider(provider),
@@ -101,7 +107,10 @@ function EnvironmentProviders({
           divider={index > 0}
         />
       ))}
-      {accounts.length === 0 ? (
+      {accounts.length === 0 &&
+      claudeAccounts.length === 0 &&
+      deepSeekAccounts.length === 0 &&
+      !canAddDeepSeek ? (
         <Text className="p-4 text-foreground-muted">
           Configure a provider with in-app sign-in in web or desktop Settings.
         </Text>
@@ -110,6 +119,10 @@ function EnvironmentProviders({
         <ClaudeAccount key={provider.instanceId} environment={environment} provider={provider} />
       ))}
       {canAddClaude ? <AddClaudeAccount environment={environment} /> : null}
+      {deepSeekAccounts.map((provider) => (
+        <DeepSeekAccount key={provider.instanceId} environment={environment} provider={provider} />
+      ))}
+      {canAddDeepSeek ? <DeepSeekAccount environment={environment} /> : null}
     </>
   );
 }

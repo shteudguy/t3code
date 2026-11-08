@@ -112,6 +112,9 @@ const PROMPT_REFUSAL_TAGS = [
 ] as const;
 
 const refusedBeforePrompt = (error: unknown): boolean =>
+  (Schema.is(ProviderAdapter.ProviderAdapterProtocolError)(error) &&
+    error.driver === "deepseek-api" &&
+    error.detail === "direct-deepseek-plan-mode-not-supported") ||
   PROMPT_REFUSAL_TAGS.some((tag) => Predicate.isTagged(error, tag)) ||
   (Predicate.hasProperty(error, "cause") && refusedBeforePrompt(error.cause));
 
