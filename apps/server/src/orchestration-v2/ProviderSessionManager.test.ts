@@ -4377,3 +4377,116 @@ it.effect("ProviderSessionManagerV2 gives a delegated child its project's device
     assert.isTrue(child?.capabilities?.has("device"));
   }),
 );
+
+it.effect(
+  "maintenance port: outer startup and nested open/startTurn drain naturally before idle release",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const outerEntered = yield* Deferred.make<void>();
+      const enterNested = yield* Deferred.make<void>();
+      const startEntered = yield* Deferred.make<void>();
+      const finishStart = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("maintenance-port-outer");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        const outer = yield* manager.withTurnStart!(
+          modelSelection.instanceId,
+          Effect.gen(function* () {
+            yield* Deferred.succeed(outerEntered, undefined);
+            yield* Deferred.await(enterNested);
+            const runtime = yield* manager.open({
+              threadId,
+              providerSessionId,
+              modelSelection,
+              runtimePolicy,
+            });
+            const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+            yield* runtime.startTurn({
+              appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
+              threadId,
+              runId,
+              runOrdinal: 1,
+              providerTurnOrdinal: 1,
+              attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+              rootNodeId: idAllocator.derive.rootNode({ runId }),
+              providerThread,
+              message: {
+                createdBy: "user",
+                creationSource: "web",
+                messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+                text: "fixture",
+                attachments: [],
+              },
+              modelSelection,
+              runtimePolicy,
+            });
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(outerEntered);
+        const reserved = yield* manager.reserveMaintenance!([modelSelection.instanceId]);
+        let installed = false;
+        const maintenance = yield* reserved
+          .withUse(
+            Effect.sync(() => {
+              installed = true;
+            }),
+          )
+          .pipe(Effect.forkScoped);
+        yield* Deferred.succeed(enterNested, undefined);
+        yield* Deferred.await(startEntered);
+        assert.isFalse(installed);
+        assert.strictEqual((yield* Ref.get(state)).interruptCount, 0);
+        assert.strictEqual((yield* Ref.get(state)).closeCount, 0);
+        yield* Deferred.succeed(finishStart, undefined);
+        yield* Fiber.join(outer);
+        assert.isFalse(installed);
+        const queue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
+        assert.isDefined(queue);
+        yield* Queue.offer(queue!, {
+          type: "turn.terminal",
+          driver: CODEX_DRIVER,
+          providerThreadId: providerThread.id,
+          providerTurnId: idAllocator.derive.providerTurn({
+            driver: CODEX_DRIVER,
+            nativeTurnId: "maintenance-port-turn",
+          }),
+          runOrdinal: 1,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+        yield* Fiber.join(maintenance);
+        assert.isTrue(installed);
+        assert.strictEqual((yield* Ref.get(state)).closeCount, 1);
+        assert.strictEqual((yield* Ref.get(state)).interruptCount, 0);
+        yield* reserved.release;
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60000,
+            startTurn: Deferred.succeed(startEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(finishStart)),
+            ),
+          }),
+        ),
+      );
+    }),
+);

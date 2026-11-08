@@ -21,6 +21,11 @@ export interface ProviderMaintenanceCapabilities {
   readonly manualCommand?: string;
 }
 
+export interface ProviderMaintenanceInstallPin {
+  readonly binaryPath: string;
+  readonly versionArgs?: ReadonlyArray<string>;
+}
+
 export interface ProviderMaintenanceCommandAction {
   readonly command: string;
   readonly executable: string;
@@ -28,4 +33,5 @@ export interface ProviderMaintenanceCommandAction {
   readonly lockKey: string;
   /** The provider's environment, including its PATH and custom home. */
   readonly env?: NodeJS.ProcessEnv;
+  readonly pin?: ProviderMaintenanceInstallPin;
 }

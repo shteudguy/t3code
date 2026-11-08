@@ -1728,11 +1728,18 @@ export const layer: Layer.Layer<
         function* (input) {
           // Storage cleanup removes worktrees under the same lease. Only startup
           // holds it; the provider turn runs after it is released.
-          const { thread } = yield* projectionStore.getThreadRecords(input.threadId, []);
-          const providerTurn = yield* thread.worktreePath === null
-            ? start(input)
-            : withWorkspaceLease(path.resolve(thread.worktreePath), start(input));
-          if (providerTurn !== undefined) yield* providerTurn;
+          const context = yield* projectionStore.getTurnStartContext(input.threadId, input.runId);
+          const { thread } = context;
+          const run = context.runs.find((candidate) => candidate.id === input.runId);
+          const startup = Effect.gen(function* () {
+            const providerTurn = yield* thread.worktreePath === null
+              ? start(input)
+              : withWorkspaceLease(path.resolve(thread.worktreePath), start(input));
+            if (providerTurn !== undefined) yield* providerTurn;
+          });
+          yield* run !== undefined && providerSessions.withTurnStart !== undefined
+            ? providerSessions.withTurnStart(run.modelSelection.instanceId, startup)
+            : startup;
         },
         (effect, input) =>
           effect.pipe(

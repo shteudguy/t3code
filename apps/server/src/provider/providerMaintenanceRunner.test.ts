@@ -7,6 +7,7 @@ import {
 } from "@t3tools/contracts";
 import { ServerProviderUpdateError } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -23,6 +24,8 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 
 import * as ProviderRegistry from "./ProviderRegistry.ts";
+import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
+import { makeProviderMaintenanceAdmission } from "./providerUpdateQueue.ts";
 import * as ModelManifest from "./ModelManifest.ts";
 import * as ProviderMaintenanceRunner from "./providerMaintenanceRunner.ts";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
@@ -239,24 +242,78 @@ const makeTestRunner = (
   },
   latestVersions: Layer.Layer<ProviderLatestVersions.ProviderLatestVersions> = ProviderLatestVersions.layer,
 ) =>
-  Effect.service(ProviderMaintenanceRunner.ProviderMaintenanceRunner).pipe(
-    Effect.provide(
+  Effect.gen(function* () {
+    const finished = new Map<
+      ProviderInstanceId,
+      Deferred.Deferred<{ readonly providers: ReadonlyArray<ServerProvider> }>
+    >();
+    const admission = yield* makeProviderMaintenanceAdmission<ProviderInstanceId, string>({
+      isBusy: () => Effect.succeed(false),
+      makeBusyError: () => "reserved",
+    });
+    const testRegistry: ProviderRegistry.ProviderRegistry["Service"] = {
+      ...registry,
+      setProviderMaintenanceActionState: (input) =>
+        registry.setProviderMaintenanceActionState(input).pipe(
+          Effect.tap((providers) => {
+            const deferred = finished.get(input.instanceId);
+            return deferred !== undefined &&
+              input.state !== null &&
+              ["succeeded", "failed", "unchanged"].includes(input.state.status)
+              ? Deferred.succeed(deferred, { providers })
+              : Effect.void;
+          }),
+        ),
+    };
+    const context = yield* Layer.build(
       ProviderMaintenanceRunner.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
-            Layer.succeed(ProviderRegistry.ProviderRegistry, registry),
+            Layer.succeed(ProviderRegistry.ProviderRegistry, testRegistry),
             Layer.succeed(ModelManifest.ModelManifest, {
               current: Effect.succeed(manifest),
               refresh: Effect.succeed(manifest),
               forceRefresh: Effect.succeed(manifest),
               refreshInBackground: Effect.void,
             }),
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+              withTurnStart: admission.withTurnStart,
+              reserveMaintenance: (ids) =>
+                admission.reserveMaintenance(ids).pipe(
+                  Effect.orDie,
+                  Effect.map((lease) => ({
+                    instanceIds: lease.instanceIds,
+                    release: lease.release,
+                    withUse: (use) => lease.awaitReady.pipe(Effect.andThen(use)),
+                  })),
+                ),
+            }),
             latestVersions,
           ),
         ),
       ),
-    ),
-  );
+    );
+    const runner = Context.get(context, ProviderMaintenanceRunner.ProviderMaintenanceRunner);
+    const awaitUpdate = Effect.fn("providerMaintenanceRunner.test.awaitUpdate")(function* (
+      target: Parameters<typeof runner.updateProvider>[0],
+    ) {
+      const id =
+        typeof target === "string"
+          ? ProviderInstanceId.make(target)
+          : (target.instanceId ?? ProviderInstanceId.make(target.provider));
+      const deferred = yield* Deferred.make<{
+        readonly providers: ReadonlyArray<ServerProvider>;
+      }>();
+      finished.set(id, deferred);
+      const snapshot = yield* runner.updateProvider(target);
+      const state = snapshot.providers.find((provider) => provider.instanceId === id)?.updateState
+        ?.status;
+      return state !== undefined && ["succeeded", "failed", "unchanged"].includes(state)
+        ? snapshot
+        : yield* Deferred.await(deferred);
+    });
+    return { ...runner, awaitUpdate };
+  });
 
 function layerFailingLatestLookupAfterFirst() {
   let lookups = 0;
@@ -280,7 +337,7 @@ describe("providerMaintenanceRunner", () => {
       const { registry, updateStatesRef } = yield* makeRegistry(baseNativeCliProvider);
       const updater = yield* makeTestRunner(registry);
 
-      const result = yield* updater.updateProvider(NATIVE_CLI_DRIVER);
+      const result = yield* updater.awaitUpdate(NATIVE_CLI_DRIVER);
       assert.deepStrictEqual(calls, [
         {
           command: "native-agent",
@@ -291,7 +348,7 @@ describe("providerMaintenanceRunner", () => {
       assert.deepStrictEqual(
         (yield* Ref.get(updateStatesRef)).map((state) => [state.status, state.message]),
         [
-          ["queued", "Waiting for another provider update to finish."],
+          ["queued", "Waiting for active provider work to finish before updating."],
           ["running", "Checking for the latest version"],
           ["running", "Running native-agent update"],
           ["running", "Verifying the installed version"],
@@ -370,7 +427,7 @@ describe("providerMaintenanceRunner", () => {
           ),
       });
 
-      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      const result = yield* updater.awaitUpdate(CODEX_DRIVER);
       assert.deepStrictEqual(refreshedInstanceIds, [CODEX_INSTANCE_ID]);
       assert.deepStrictEqual(calls, skip ? [] : [{ command: "claude", args: ["update"] }]);
       if (!skip) return;
@@ -379,7 +436,7 @@ describe("providerMaintenanceRunner", () => {
       assert.deepStrictEqual(
         (yield* Ref.get(updateStatesRef)).map((state) => [state.status, state.message]),
         [
-          ["queued", "Waiting for another provider update to finish."],
+          ["queued", "Waiting for active provider work to finish before updating."],
           ["running", "Checking for the latest version"],
           ["succeeded", "Already up to date."],
         ],
@@ -419,7 +476,7 @@ describe("providerMaintenanceRunner", () => {
           ),
       });
 
-      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      const result = yield* updater.awaitUpdate(CODEX_DRIVER);
       assert.deepStrictEqual(calls, [{ command: "claude", args: ["update"] }]);
       assert.strictEqual(result.providers[0]?.updateState?.status, "succeeded");
     }).pipe(
@@ -478,7 +535,7 @@ describe("providerMaintenanceRunner", () => {
         layerFailingLatestLookupAfterFirst(),
       );
 
-      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      const result = yield* updater.awaitUpdate(CODEX_DRIVER);
       assert.deepStrictEqual(calls, [{ command: "claude", args: ["update"] }]);
       assert.strictEqual(result.providers[0]?.updateState?.status, "succeeded");
     }).pipe(
@@ -508,7 +565,7 @@ describe("providerMaintenanceRunner", () => {
             ),
         });
 
-        const result = yield* updater.updateProvider(NATIVE_CLI_DRIVER);
+        const result = yield* updater.awaitUpdate(NATIVE_CLI_DRIVER);
         assert.strictEqual(result.providers[0]?.updateState?.status, "succeeded");
       }).pipe(
         Effect.provide(
@@ -541,7 +598,7 @@ describe("providerMaintenanceRunner", () => {
           }),
       });
 
-      yield* updater.updateProvider(CODEX_DRIVER);
+      yield* updater.awaitUpdate(CODEX_DRIVER);
       assert.deepStrictEqual(seen, [{ CODEX_HOME: "/work/codex-home" }]);
     }).pipe(
       Effect.provide(
@@ -557,7 +614,7 @@ describe("providerMaintenanceRunner", () => {
     );
   });
 
-  it.effect("re-resolves ownership before running and executes the fresh command", () => {
+  it.effect("refuses to run a command whose ownership changed while queued", () => {
     const calls: Array<{ command: string; args: ReadonlyArray<string> }> = [];
     const fresh: Array<boolean> = [];
     return Effect.gen(function* () {
@@ -578,11 +635,10 @@ describe("providerMaintenanceRunner", () => {
         },
       });
 
-      yield* updater.updateProvider(CODEX_DRIVER);
-      assert.deepStrictEqual(fresh, [false, true, true]);
-      assert.deepStrictEqual(calls, [
-        { command: "/opt/homebrew/bin/brew", args: ["upgrade", "--cask", "codex"] },
-      ]);
+      const result = yield* updater.awaitUpdate(CODEX_DRIVER);
+      assert.isTrue(fresh.includes(true));
+      assert.deepStrictEqual(calls, []);
+      assert.strictEqual(result.providers[0]?.updateState?.status, "failed");
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
@@ -656,12 +712,12 @@ describe("providerMaintenanceRunner", () => {
           ),
       });
 
-      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      const result = yield* updater.awaitUpdate(CODEX_DRIVER);
       assert.deepStrictEqual(calls, []);
       assert.strictEqual(result.providers[0]?.updateState?.status, "failed");
       assert.strictEqual(
         result.providers[0]?.updateState?.message,
-        "Provider installation changed. Refresh and try again.",
+        "Provider settings or installation group changed while waiting. Refresh and try again.",
       );
       assert.deepStrictEqual(
         (yield* Ref.get(updateStatesRef)).map((state) => state.status),
@@ -686,7 +742,7 @@ describe("providerMaintenanceRunner", () => {
       const { registry } = yield* makeRegistry();
       const updater = yield* makeTestRunner(registry);
 
-      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      const result = yield* updater.awaitUpdate(CODEX_DRIVER);
       const updateState = result.providers[0]?.updateState;
 
       assert.strictEqual(updateState?.status, "failed");
@@ -715,7 +771,7 @@ describe("providerMaintenanceRunner", () => {
       const { registry } = yield* makeRegistry();
       const updater = yield* makeTestRunner(registry);
 
-      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      const result = yield* updater.awaitUpdate(CODEX_DRIVER);
 
       assert.strictEqual(
         result.providers[0]?.updateState?.message,
@@ -743,7 +799,7 @@ describe("providerMaintenanceRunner", () => {
         });
         const updater = yield* makeTestRunner(registry);
 
-        const result = yield* updater.updateProvider(CODEX_DRIVER);
+        const result = yield* updater.awaitUpdate(CODEX_DRIVER);
 
         assert.strictEqual(result.providers[0]?.updateState?.status, "unchanged");
         assert.include(result.providers[0]?.updateState?.message ?? "", "still detects");
@@ -770,7 +826,7 @@ describe("providerMaintenanceRunner", () => {
       const { registry } = yield* makeRegistry(baseNativeCliProvider);
       const updater = yield* makeTestRunner(registry);
 
-      const update = yield* updater.updateProvider(NATIVE_CLI_DRIVER).pipe(Effect.forkScoped);
+      const update = yield* updater.awaitUpdate(NATIVE_CLI_DRIVER).pipe(Effect.forkScoped);
       yield* Deferred.await(started);
       yield* TestClock.adjust(runFor);
       const result = yield* Fiber.join(update);
@@ -793,7 +849,7 @@ describe("providerMaintenanceRunner", () => {
     );
   });
 
-  it.effect("prevents concurrent updates for the same provider", () => {
+  it.effect("deduplicates concurrent queued updates for the same provider", () => {
     const startedLatch: { resolve: () => void } = { resolve: () => {} };
     const releaseLatch: { resolve: () => void } = { resolve: () => {} };
     const started = new Promise<void>((resolve) => {
@@ -806,18 +862,11 @@ describe("providerMaintenanceRunner", () => {
       const { registry } = yield* makeRegistry();
       const updater = yield* makeTestRunner(registry);
 
-      const first = yield* updater.updateProvider(CODEX_DRIVER).pipe(Effect.forkScoped);
+      const first = yield* updater.awaitUpdate(CODEX_DRIVER).pipe(Effect.forkScoped);
       yield* Effect.promise(() => started);
 
-      const second = yield* updater.updateProvider(CODEX_DRIVER).pipe(Effect.exit);
-      assert.strictEqual(Exit.isFailure(second), true);
-      if (Exit.isFailure(second)) {
-        const error = Cause.squash(second.cause);
-        assert.strictEqual(isServerProviderUpdateError(error), true);
-        if (isServerProviderUpdateError(error)) {
-          assert.include(error.reason, "already running");
-        }
-      }
+      const second = yield* updater.updateProvider(CODEX_DRIVER);
+      assert.isTrue(["queued", "running"].includes(second.providers[0]?.updateState?.status ?? ""));
 
       releaseLatch.resolve();
       yield* Fiber.join(first);
@@ -840,58 +889,56 @@ describe("providerMaintenanceRunner", () => {
     );
   });
 
-  it.effect(
-    "releases the running-provider marker when interrupted after queuing but before the lock run starts",
-    () =>
-      Effect.gen(function* () {
-        const { registry } = yield* makeRegistry(baseProvider, {
-          installedVersionAfterUpdate: "1.0.0",
-        });
-        let blockQueuedState = true;
-        const queuedStateWrittenLatch: { resolve: () => void } = { resolve: () => {} };
-        const releaseQueuedStateLatch: { resolve: () => void } = { resolve: () => {} };
-        const queuedStateWritten = new Promise<void>((resolve) => {
-          queuedStateWrittenLatch.resolve = resolve;
-        });
-        const releaseQueuedState = new Promise<void>((resolve) => {
-          releaseQueuedStateLatch.resolve = resolve;
-        });
+  it.effect("keeps the server-owned job when its queued RPC caller is interrupted", () =>
+    Effect.gen(function* () {
+      const { registry } = yield* makeRegistry(baseProvider, {
+        installedVersionAfterUpdate: "1.0.0",
+      });
+      let blockQueuedState = true;
+      const queuedStateWrittenLatch: { resolve: () => void } = { resolve: () => {} };
+      const releaseQueuedStateLatch: { resolve: () => void } = { resolve: () => {} };
+      const queuedStateWritten = new Promise<void>((resolve) => {
+        queuedStateWrittenLatch.resolve = resolve;
+      });
+      const releaseQueuedState = new Promise<void>((resolve) => {
+        releaseQueuedStateLatch.resolve = resolve;
+      });
 
-        const updater = yield* makeTestRunner({
-          ...registry,
-          setProviderMaintenanceActionState: Effect.fn(
-            "providerMaintenanceRunner.test.blockQueuedState",
-          )(function* (input) {
-            const providers = yield* registry.setProviderMaintenanceActionState(input);
-            if (input.state?.status === "queued" && blockQueuedState) {
-              queuedStateWrittenLatch.resolve();
-              yield* Effect.promise(() => releaseQueuedState);
-            }
-            return providers;
-          }),
-        });
+      const updater = yield* makeTestRunner({
+        ...registry,
+        setProviderMaintenanceActionState: Effect.fn(
+          "providerMaintenanceRunner.test.blockQueuedState",
+        )(function* (input) {
+          const providers = yield* registry.setProviderMaintenanceActionState(input);
+          if (input.state?.status === "queued" && blockQueuedState) {
+            queuedStateWrittenLatch.resolve();
+            yield* Effect.promise(() => releaseQueuedState);
+          }
+          return providers;
+        }),
+      });
 
-        const first = yield* updater.updateProvider(CODEX_DRIVER).pipe(Effect.forkScoped);
-        yield* Effect.promise(() => queuedStateWritten);
-        blockQueuedState = false;
+      const first = yield* updater.awaitUpdate(CODEX_DRIVER).pipe(Effect.forkScoped);
+      yield* Effect.promise(() => queuedStateWritten);
+      blockQueuedState = false;
 
-        yield* Fiber.interrupt(first);
-        releaseQueuedStateLatch.resolve();
+      yield* Fiber.interrupt(first);
+      releaseQueuedStateLatch.resolve();
 
-        const second = yield* updater.updateProvider(CODEX_DRIVER).pipe(Effect.exit);
-        assert.strictEqual(Exit.isSuccess(second), true);
-        if (Exit.isSuccess(second)) {
-          assert.strictEqual(second.value.providers[0]?.updateState?.status, "succeeded");
-        }
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            layerNonWindowsPlatform,
-            layerLatestVersionHttpClient("1.0.0"),
-            layerMockSpawner(() => ({ stdout: "updated" })),
-          ),
+      const second = yield* updater.awaitUpdate(CODEX_DRIVER).pipe(Effect.exit);
+      assert.strictEqual(Exit.isSuccess(second), true);
+      if (Exit.isSuccess(second)) {
+        assert.strictEqual(second.value.providers[0]?.updateState?.status, "succeeded");
+      }
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          layerNonWindowsPlatform,
+          layerLatestVersionHttpClient("1.0.0"),
+          layerMockSpawner(() => ({ stdout: "updated" })),
         ),
       ),
+    ),
   );
 
   it.effect("resolves npm to a .cmd shim from the provider's PATH on win32", () => {
@@ -1054,7 +1101,7 @@ it.effect.each([
         manifest,
       );
 
-      const result = yield* updater.updateProvider({
+      const result = yield* updater.awaitUpdate({
         provider: OPENCODE_DRIVER,
         ...(mode === "default" ? {} : { targetVersion: "1.14.20" }),
       });
@@ -1129,13 +1176,13 @@ it.effect(
         manifest,
       );
 
-      const unchanged = yield* updater.updateProvider(CODEX_DRIVER);
+      const unchanged = yield* updater.awaitUpdate(CODEX_DRIVER);
       assert.strictEqual(unchanged.providers[0]?.updateState?.status, "unchanged");
       assert.match(unchanged.providers[0]?.updateState?.message ?? "", /outdated provider version/);
       assert.deepStrictEqual(calls, ["upgrade --cask codex"]);
 
       latest = "3.0.0";
-      const refused = yield* updater.updateProvider(CODEX_DRIVER);
+      const refused = yield* updater.awaitUpdate(CODEX_DRIVER);
       assert.strictEqual(refused.providers[0]?.updateState?.status, "failed");
       assert.match(refused.providers[0]?.updateState?.message ?? "", /incompatible/);
       assert.deepStrictEqual(calls, ["upgrade --cask codex"]);
@@ -1192,7 +1239,7 @@ it.effect("refuses incompatible latest versions and unapproved or unpinnable tar
       manifest,
     );
     for (const targetVersion of [undefined, "", "1.0.0", "2.0.0; echo unsafe"]) {
-      const result = yield* updater.updateProvider({
+      const result = yield* updater.awaitUpdate({
         provider: CODEX_DRIVER,
         ...(targetVersion !== undefined ? { targetVersion } : {}),
       });
@@ -1202,7 +1249,7 @@ it.effect("refuses incompatible latest versions and unapproved or unpinnable tar
     yield* Ref.update(providersRef, (providers) =>
       providers.map((entry) => ({ ...entry, version: "2.0.0" })),
     );
-    const installed = yield* updater.updateProvider({
+    const installed = yield* updater.awaitUpdate({
       provider: CODEX_DRIVER,
       targetVersion: "2.0.0",
     });
@@ -1211,7 +1258,7 @@ it.effect("refuses incompatible latest versions and unapproved or unpinnable tar
     yield* Ref.update(providersRef, (providers) =>
       providers.map((entry) => ({ ...entry, version: "1.0.0" })),
     );
-    const unchanged = yield* updater.updateProvider({
+    const unchanged = yield* updater.awaitUpdate({
       provider: CODEX_DRIVER,
       targetVersion: "2.0.0",
     });

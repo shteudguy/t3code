@@ -70,6 +70,11 @@ import {
   type SettingsSecret,
 } from "./settingsSecrets.ts";
 
+import {
+  prepareProviderBinaryPathSwitch,
+  type ProviderBinaryPathSwitchChange,
+} from "./provider/providerBinaryPathSwitch.ts";
+
 export {
   resolveReviewGuideModelSelection,
   resolveSourceControlWriterModelSelection,
@@ -250,6 +255,17 @@ function ensureProviderInstanceMutationAllowed(
   return Effect.void;
 }
 
+function providerBinaryPathSwitchInputError(
+  settingsPath: string,
+  reason: string,
+): ServerSettingsError {
+  return new ServerSettingsError({
+    settingsPath,
+    operation: "write-file",
+    cause: new Error(`Rejected atomic provider binary-path switch: ${reason}`),
+  });
+}
+
 export class ServerSettingsService extends Context.Service<
   ServerSettingsService,
   {
@@ -270,6 +286,10 @@ export class ServerSettingsService extends Context.Service<
       mutation: ProviderInstanceMutation,
       patch?: ServerSettingsPatch,
     ) => Effect.Effect<ServerSettings, ServerSettingsError>;
+
+    readonly switchProviderBinaryPaths: (
+      changes: ReadonlyArray<ProviderBinaryPathSwitchChange>,
+    ) => Effect.Effect<{ readonly status: "switched" | "conflict" }, ServerSettingsError>;
 
     readonly withSettingsSnapshot: <A, E, R>(
       use: (settings: ServerSettings) => Effect.Effect<A, E, R>,
@@ -334,6 +354,22 @@ const makeTest = Effect.fn("serverSettings.makeTest")(function* (
           yield* ensureProviderInstanceMutationAllowed(currentSettings, mutation, "test settings");
           const patched = applyServerSettingsPatch(currentSettings, patch);
           return applyProviderInstanceMutation(patched, mutation);
+        }),
+      ),
+    switchProviderBinaryPaths: (changes) =>
+      writeSemaphore.withPermits(1)(
+        Effect.gen(function* () {
+          const current = yield* Ref.get(currentSettingsRef);
+          const prepared = prepareProviderBinaryPathSwitch(current, changes);
+          if (prepared.status === "invalid") {
+            return yield* providerBinaryPathSwitchInputError("test settings", prepared.reason);
+          }
+          if (prepared.status === "conflict") return { status: "conflict" as const };
+          if (prepared.changed) {
+            const next = yield* normalizeServerSettings(prepared.settings);
+            yield* Ref.set(currentSettingsRef, next);
+          }
+          return { status: "switched" as const };
         }),
       ),
     withSettingsSnapshot: (use) =>
@@ -783,7 +819,7 @@ const make = Effect.gen(function* () {
     },
   );
 
-  const loadSettingsFromDisk = Effect.gen(function* () {
+  const readSettingsSnapshotFromDisk = Effect.gen(function* () {
     let settings = managed.defaults;
     let legacyProviders: Readonly<Record<string, unknown>> | undefined;
     let legacySourceControl: Parameters<typeof migrateLegacySourceControlSettings>[1] = {};
@@ -885,46 +921,53 @@ const make = Effect.gen(function* () {
     const folded = settingsFileTrusted
       ? foldLegacyProjectSettings(loaded, legacyProjectRows)
       : loaded;
-    // Remove retired keys only after copying secrets and writing the new file; failures retry on next load.
-    const legacySecretsCopied = yield* Effect.forEach(
-      settingsFileTrusted
-        ? migrateLegacySourceControlSettings(folded, legacySourceControl).secretMoves
-        : [],
-      (move) =>
-        secretStore.get(move.from).pipe(
-          Effect.flatMap((secret) =>
-            Option.isNone(secret) ? Effect.void : secretStore.set(move.to, secret.value),
+    const commitMigrations = Effect.gen(function* () {
+      // Remove retired keys only after copying secrets and writing the new file; failures retry on next load.
+      const legacySecretsCopied = yield* Effect.forEach(
+        settingsFileTrusted
+          ? migrateLegacySourceControlSettings(folded, legacySourceControl).secretMoves
+          : [],
+        (move) =>
+          secretStore.get(move.from).pipe(
+            Effect.flatMap((secret) =>
+              Option.isNone(secret) ? Effect.void : secretStore.set(move.to, secret.value),
+            ),
+            Effect.as(true),
+            Effect.catch(() =>
+              Effect.logWarning("failed to copy a source control secret to its new name", {
+                secretName: move.to,
+              }).pipe(Effect.as(false)),
+            ),
           ),
-          Effect.as(true),
-          Effect.catch(() =>
-            Effect.logWarning("failed to copy a source control secret to its new name", {
-              secretName: move.to,
-            }).pipe(Effect.as(false)),
-          ),
-        ),
-    ).pipe(Effect.map((copied) => copied.every(Boolean)));
-    const hasLegacySourceControl =
-      settingsFileTrusted &&
-      legacySecretsCopied &&
-      (legacySourceControl.bitbucket !== undefined || legacySourceControl.github !== undefined);
-    const sourceControlMigration = hasLegacySourceControl
-      ? migrateLegacySourceControlSettings(folded, legacySourceControl)
-      : { settings: folded, secretMoves: [] };
-    const migrated = settingsFileTrusted
-      ? yield* moveInlineSettingsSecrets(sourceControlMigration.settings)
-      : folded;
-    if (
-      migrated !== loaded ||
-      (settingsFileTrusted && legacyProviders !== undefined) ||
-      hasLegacySourceControl
-    ) {
-      yield* writeSettingsAtomically(migrated);
-      for (const move of sourceControlMigration.secretMoves) {
-        yield* secretStore.remove(move.from).pipe(Effect.ignore);
+      ).pipe(Effect.map((copied) => copied.every(Boolean)));
+      const hasLegacySourceControl =
+        settingsFileTrusted &&
+        legacySecretsCopied &&
+        (legacySourceControl.bitbucket !== undefined || legacySourceControl.github !== undefined);
+      const sourceControlMigration = hasLegacySourceControl
+        ? migrateLegacySourceControlSettings(folded, legacySourceControl)
+        : { settings: folded, secretMoves: [] };
+      const migrated = settingsFileTrusted
+        ? yield* moveInlineSettingsSecrets(sourceControlMigration.settings)
+        : folded;
+      if (
+        migrated !== loaded ||
+        (settingsFileTrusted && legacyProviders !== undefined) ||
+        hasLegacySourceControl
+      ) {
+        yield* writeSettingsAtomically(migrated);
+        for (const move of sourceControlMigration.secretMoves) {
+          yield* secretStore.remove(move.from).pipe(Effect.ignore);
+        }
       }
-    }
-    return { settings: migrated, parseFailure };
+      return { settings: migrated, parseFailure };
+    });
+    return { settings: folded, parseFailure, commitMigrations };
   });
+
+  const loadSettingsFromDisk = readSettingsSnapshotFromDisk.pipe(
+    Effect.flatMap(({ commitMigrations }) => commitMigrations),
+  );
 
   const settingsCache = yield* Cache.makeWith((_key: typeof cacheKey) => loadSettingsFromDisk, {
     capacity: 1,
@@ -1158,6 +1201,69 @@ const make = Effect.gen(function* () {
     );
   };
 
+  const persistUpdatedSettings = Effect.fn("serverSettings.persistUpdatedSettings")(function* (
+    current: ServerSettings,
+    updated: ServerSettings,
+    patch: ServerSettingsPatch,
+  ) {
+    // Vet before secrets: a variable the policy hides from clients is not one they removed.
+    const vetted = managed.vetWrite(current, yield* normalizeServerSettings(updated), patch);
+    if (vetted._tag === "Locked") {
+      return yield* new ServerSettingsError({
+        settingsPath,
+        operation: "write-managed-setting",
+        managedSetting: vetted.path,
+        managedBy: managedPolicy?.organization,
+      });
+    }
+    const vettedProviders = managedProviders.vetWrite(current, vetted.settings);
+    if (vettedProviders._tag === "Locked") {
+      return yield* new ServerSettingsError({
+        settingsPath,
+        operation: "write-managed-setting",
+        managedSetting: vettedProviders.path,
+        managedBy: managedPolicy?.organization,
+      });
+    }
+    if (vettedProviders._tag === "Disallowed") {
+      return yield* new ServerSettingsError({
+        settingsPath,
+        operation: "use-disallowed-provider",
+        providerInstanceId: vettedProviders.instanceId,
+        providerLabel: vettedProviders.label,
+        managedBy: managedPolicy?.organization,
+      });
+    }
+    // After vetting, which can keep stored variables a policy hides from clients.
+    const persisted = yield* persistSettingsSecrets(
+      current,
+      withoutRemovedSecretProviderReferences(current, vettedProviders.settings),
+    );
+    const next = yield* normalizeServerSettings(persisted.settings);
+    const materializedNext = yield* Effect.uninterruptibleMask(() =>
+      Effect.gen(function* () {
+        yield* invalidateMaterialized;
+        const rollbackSecretChanges = yield* applySettingsSecretChanges(persisted.changes);
+        const materializedExit = yield* Effect.exit(materializeSettingsSecrets(next));
+        if (Exit.isFailure(materializedExit)) {
+          yield* rollbackSecretChanges;
+          return yield* Effect.failCause(materializedExit.cause);
+        }
+        const writeExit = yield* Effect.exit(writeSettingsAtomically(next));
+        if (Exit.isFailure(writeExit)) {
+          yield* rollbackSecretChanges;
+          return yield* Effect.failCause(writeExit.cause);
+        }
+        return materializedExit.value;
+      }).pipe(Effect.ensuring(invalidateMaterialized)),
+    );
+    yield* Cache.set(settingsCache, cacheKey, { settings: next, parseFailure: Option.none() });
+    const resolved = toEffective(materializedNext);
+    materialized = { source: next, value: resolved };
+    yield* emitChange(next);
+    return resolved;
+  });
+
   const updateAndPersistSettings = (
     patch: ServerSettingsPatch,
     update: (current: ServerSettings) => Effect.Effect<ServerSettings, ServerSettingsError>,
@@ -1175,62 +1281,42 @@ const make = Effect.gen(function* () {
         // An older client echoes a reference as the redacted marker; restore it before vetting so
         // a removed provider's reference is cleared below rather than restored by persistence.
         const updated = withEchoedSecretReferences(current, yield* update(current));
-        // Vet before secrets: a variable the policy hides from clients is not one they removed.
-        const vetted = managed.vetWrite(current, yield* normalizeServerSettings(updated), patch);
-        if (vetted._tag === "Locked") {
+        return yield* persistUpdatedSettings(current, updated, patch);
+      }),
+    );
+
+  const switchProviderBinaryPaths: ServerSettingsService["Service"]["switchProviderBinaryPaths"] = (
+    changes,
+  ) =>
+    writeSemaphore.withPermits(1)(
+      Effect.gen(function* () {
+        const snapshot = yield* readSettingsSnapshotFromDisk;
+        const { settings: current, parseFailure } = snapshot;
+        if (Option.isSome(parseFailure)) {
           return yield* new ServerSettingsError({
             settingsPath,
-            operation: "write-managed-setting",
-            managedSetting: vetted.path,
-            managedBy: managedPolicy?.organization,
+            operation: "read-file",
+            cause: parseFailure.value,
           });
         }
-        const vettedProviders = managedProviders.vetWrite(current, vetted.settings);
-        if (vettedProviders._tag === "Locked") {
-          return yield* new ServerSettingsError({
-            settingsPath,
-            operation: "write-managed-setting",
-            managedSetting: vettedProviders.path,
-            managedBy: managedPolicy?.organization,
-          });
+        const prepared = prepareProviderBinaryPathSwitch(current, changes);
+        if (prepared.status === "invalid") {
+          return yield* providerBinaryPathSwitchInputError(settingsPath, prepared.reason);
         }
-        if (vettedProviders._tag === "Disallowed") {
-          return yield* new ServerSettingsError({
-            settingsPath,
-            operation: "use-disallowed-provider",
-            providerInstanceId: vettedProviders.instanceId,
-            providerLabel: vettedProviders.label,
-            managedBy: managedPolicy?.organization,
-          });
+        if (prepared.status === "conflict") return { status: "conflict" as const };
+        if (prepared.changed) {
+          const migrated = yield* snapshot.commitMigrations;
+          yield* Cache.set(settingsCache, cacheKey, migrated);
+          const migratedBatch = prepareProviderBinaryPathSwitch(migrated.settings, changes);
+          if (migratedBatch.status !== "switched") {
+            return yield* providerBinaryPathSwitchInputError(
+              settingsPath,
+              "Settings migration changed a previously accepted provider pin batch.",
+            );
+          }
+          yield* persistUpdatedSettings(migrated.settings, migratedBatch.settings, {});
         }
-        // After vetting, which can keep stored variables a policy hides from clients.
-        const persisted = yield* persistSettingsSecrets(
-          current,
-          withoutRemovedSecretProviderReferences(current, vettedProviders.settings),
-        );
-        const next = yield* normalizeServerSettings(persisted.settings);
-        const materializedNext = yield* Effect.uninterruptibleMask(() =>
-          Effect.gen(function* () {
-            yield* invalidateMaterialized;
-            const rollbackSecretChanges = yield* applySettingsSecretChanges(persisted.changes);
-            const materializedExit = yield* Effect.exit(materializeSettingsSecrets(next));
-            if (Exit.isFailure(materializedExit)) {
-              yield* rollbackSecretChanges;
-              return yield* Effect.failCause(materializedExit.cause);
-            }
-            const writeExit = yield* Effect.exit(writeSettingsAtomically(next));
-            if (Exit.isFailure(writeExit)) {
-              yield* rollbackSecretChanges;
-              return yield* Effect.failCause(writeExit.cause);
-            }
-            return materializedExit.value;
-          }).pipe(Effect.ensuring(invalidateMaterialized)),
-        );
-        yield* Cache.set(settingsCache, cacheKey, { settings: next, parseFailure: Option.none() });
-        const resolved = toEffective(materializedNext);
-        materialized = { source: next, value: resolved };
-        yield* emitChange(next);
-        return resolved;
+        return { status: "switched" as const };
       }),
     );
 
@@ -1357,6 +1443,7 @@ const make = Effect.gen(function* () {
           return applyProviderInstanceMutation(patched, mutation);
         }),
       ),
+    switchProviderBinaryPaths,
     withSettingsSnapshot,
     get streamChanges() {
       return materializeChanges(Stream.fromPubSub(changesPubSub));
